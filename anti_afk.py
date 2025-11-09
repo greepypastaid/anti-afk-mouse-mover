@@ -17,7 +17,7 @@ except ImportError:
     sys.exit(1)
 
 pyautogui.FAILSAFE = True
-DEFAULT_MIN_MOVE = 8  # pixels: ignore tiny automatic moves that conflict with user
+DEFAULT_MIN_MOVE = 8
 
 @dataclass
 class Config:
@@ -36,12 +36,36 @@ class Config:
     verbose: bool = False
     min_move: int = DEFAULT_MIN_MOVE
     prompt_interval: bool = False
+    local_move: bool = False
+    move_radius: int = 110
+    click_interval_min: float = 120.0
+    click_interval_max: float = 480.0
+    scroll_interval_min: float = 90.0
+    scroll_interval_max: float = 360.0
+    double_click_probability: float = 0.05
+    pause_probability: float = 0.15
+    pause_duration_min: float = 0.3
+    pause_duration_max: float = 2.5
+    micro_move_probability: float = 0.25
+    micro_move_radius: int = 15
+    long_pause_probability: float = 0.05
+    long_pause_min: float = 5.0
+    long_pause_max: float = 18.0
 
 class State:
     def __init__(self):
         self.running = True
         self.paused = False
         self.lock = threading.Lock()
+        now = time.time()
+        self.next_click_at = now + 999999.0
+        self.next_scroll_at = now + 999999.0
+
+    def schedule_next_click(self, cfg: Config) -> None:
+        self.next_click_at = time.time() + rand_uniform(cfg.click_interval_min, cfg.click_interval_max)
+
+    def schedule_next_scroll(self, cfg: Config) -> None:
+        self.next_scroll_at = time.time() + rand_uniform(cfg.scroll_interval_min, cfg.scroll_interval_max)
 
     def toggle_pause(self):
         with self.lock:
@@ -66,38 +90,47 @@ def dist(a: Tuple[int, int], b: Tuple[int, int]) -> float:
 
 def choose_point(config: Config) -> Tuple[int, int]:
     width, height = pyautogui.size()
-    x = random.randint(config.margin, width - config.margin)
-    y = random.randint(config.margin, height - config.margin)
-    return x, y
+    if config.local_move:
+        cx, cy = pyautogui.position()
+        for _ in range(20):
+            angle = rand_uniform(0, 2 * math.pi)
+            r = rand_uniform(0, config.move_radius)
+            x = int(round(cx + math.cos(angle) * r))
+            y = int(round(cy + math.sin(angle) * r))
+            x = max(config.margin, min(width - config.margin, x))
+            y = max(config.margin, min(height - config.margin, y))
+            if (x, y) != (cx, cy):
+                return x, y
+        return max(config.margin, min(width - config.margin, cx + config.move_radius // 2)), max(config.margin, min(height - config.margin, cy))
+    else:
+        x = random.randint(config.margin, width - config.margin)
+        y = random.randint(config.margin, height - config.margin)
+        return x, y
 
 
 def bezier_path(start: Tuple[int,int], end: Tuple[int,int], steps: int) -> list[Tuple[int,int]]:
-    # Quadratic Bezier with random control point near midpoint + jitter
     (x0, y0), (x2, y2) = start, end
     mx, my = (x0 + x2)/2, (y0 + y2)/2
-    # Control point offset
-    dx = (x2 - x0) * rand_uniform(-0.3, 0.3)
-    dy = (y2 - y0) * rand_uniform(-0.3, 0.3)
+    dx = (x2 - x0) * rand_uniform(-0.5, 0.5)
+    dy = (y2 - y0) * rand_uniform(-0.5, 0.5)
     x1, y1 = mx + dx, my + dy
     pts = []
     for i in range(steps):
         t = i / (steps - 1)
-        # Quadratic Bezier formula
         x = (1 - t)**2 * x0 + 2*(1 - t)*t*x1 + t**2 * x2
         y = (1 - t)**2 * y0 + 2*(1 - t)*t*y1 + t**2 * y2
-        # jitter
-        jitter_scale = 0.6 * (math.sin(t * math.pi) ** 2)
-        x += rand_uniform(-2, 2) * jitter_scale
-        y += rand_uniform(-2, 2) * jitter_scale
+        jitter_scale = 0.8 * (math.sin(t * math.pi) ** 2)
+        if random.random() < 0.1:
+            jitter_scale *= 1.5
+        x += rand_uniform(-3, 3) * jitter_scale
+        y += rand_uniform(-3, 3) * jitter_scale
         pts.append((int(round(x)), int(round(y))))
     return pts
 
 
 def perform_move(target: Tuple[int,int], duration: float, config: Config):
     start_pos = pyautogui.position()
-    # If user moved the mouse recently (or target is too close), skip to avoid fighting them
     if dist(start_pos, target) < config.min_move:
-        # do a small jitter instead of a full move to appear alive but not override user
         if config.dry_run:
             logging.info("[MOVE] Skipped (too close) %s -> %s", start_pos, target)
         else:
@@ -106,13 +139,12 @@ def perform_move(target: Tuple[int,int], duration: float, config: Config):
             pyautogui.moveTo(jitter_x, jitter_y, duration=0.05)
         return
 
-    steps = max(6, int(duration * rand_uniform(30, 60)))
+    steps = max(8, int(duration * rand_uniform(40, 80)))
     path = bezier_path(start_pos, target, steps)
     if config.dry_run:
         logging.info("[MOVE] %s -> %s duration=%.2fs steps=%d", start_pos, target, duration, len(path))
         return
 
-    # Use moveTo with small durations for smoother movement and fewer explicit sleeps
     start_time = time.time()
     for i, (x, y) in enumerate(path):
         elapsed = time.time() - start_time
@@ -120,40 +152,95 @@ def perform_move(target: Tuple[int,int], duration: float, config: Config):
         steps_left = len(path) - i
         if steps_left <= 0:
             break
-        # allocate time for this chunk
         sleep_chunk = remaining / steps_left
-        # clamp a minimal duration to avoid zero-duration rapid calls
-        chunk_dur = max(0.001, sleep_chunk)
+        speed_variation = rand_uniform(0.8, 1.2)
+        chunk_dur = max(0.001, sleep_chunk * speed_variation)
         pyautogui.moveTo(x, y, duration=chunk_dur)
 
 
+def perform_micro_move(config: Config):
+    """Tiny restless movement around current position."""
+    current = pyautogui.position()
+    hops = random.randint(2, 4)
+    if config.dry_run:
+        logging.info("[MICRO-MOVE] starting at %s with %d hops", current, hops)
+        return
+    for idx in range(hops):
+        angle = rand_uniform(0, 2 * math.pi)
+        r = rand_uniform(2, config.micro_move_radius)
+        nx = int(round(current[0] + math.cos(angle) * r))
+        ny = int(round(current[1] + math.sin(angle) * r))
+        pyautogui.moveTo(nx, ny, duration=rand_uniform(0.05, 0.18))
+        if random.random() < 0.35 and idx < hops - 1:
+            time.sleep(rand_uniform(0.05, 0.2))
+
+
 def maybe_click(config: Config):
-    if random.random() < config.click_probability:
-        right = random.random() < config.right_click_probability
-        btn = 'right' if right else 'left'
-        if config.dry_run:
-            logging.info("[CLICK] button=%s", btn)
-        else:
+    # Human-like clicking with occasional double-clicks
+    right = random.random() < config.right_click_probability
+    btn = 'right' if right else 'left'
+    
+    # Check for double-click
+    is_double = random.random() < config.double_click_probability
+    clicks = 2 if is_double else 1
+    
+    if config.dry_run:
+        logging.info("[CLICK] button=%s clicks=%d", btn, clicks)
+    else:
+        # small correction movement before click
+        if random.random() < 0.3:
+            pyautogui.moveRel(rand_uniform(-5, 5), rand_uniform(-5, 5), duration=rand_uniform(0.04, 0.12))
+        if clicks == 1:
             pyautogui.click(button=btn)
-        return True
-    return False
+        else:
+            # Double-click with slight human delay
+            pyautogui.click(button=btn)
+            time.sleep(rand_uniform(0.08, 0.15))
+            pyautogui.click(button=btn)
+        # slight mouse drift after click
+        if random.random() < 0.25:
+            pyautogui.moveRel(rand_uniform(-6, 6), rand_uniform(-4, 4), duration=rand_uniform(0.05, 0.14))
+    return True
 
 
 def maybe_scroll(config: Config):
-    if random.random() < config.scroll_probability:
-        amt = random.randint(config.scroll_amount_min, config.scroll_amount_max)
-        direction = -1 if random.random() < 0.5 else 1  # pyautogui: positive is up
-        scroll_val = direction * amt
-        if config.dry_run:
-            logging.info("[SCROLL] amount=%d", scroll_val)
+    # More natural scrolling - smaller amounts, varied speeds
+    amt = random.randint(config.scroll_amount_min, config.scroll_amount_max)
+    direction = -1 if random.random() < 0.5 else 1  # pyautogui: positive is up
+    scroll_val = direction * amt
+    
+    if config.dry_run:
+        logging.info("[SCROLL] amount=%d", scroll_val)
+    else:
+        # Sometimes do multiple small scrolls instead of one big one (more human)
+        if abs(scroll_val) > 100 and random.random() < 0.4:
+            # Break into 2-3 smaller scrolls
+            num_scrolls = random.randint(2, 3)
+            per_scroll = scroll_val // num_scrolls
+            for i in range(num_scrolls):
+                pyautogui.scroll(per_scroll)
+                if i < num_scrolls - 1:
+                    time.sleep(rand_uniform(0.05, 0.15))
+        elif random.random() < 0.25:
+            # short hover with tiny move before a single scroll
+            pyautogui.moveRel(rand_uniform(-4, 4), rand_uniform(-4, 4), duration=rand_uniform(0.04, 0.1))
+            pyautogui.scroll(scroll_val)
         else:
             pyautogui.scroll(scroll_val)
-        return True
-    return False
+        # occasional scroll correction in opposite direction
+        if random.random() < 0.2:
+            correction = int(scroll_val * rand_uniform(-0.3, -0.1))
+            if correction != 0:
+                time.sleep(rand_uniform(0.05, 0.2))
+                pyautogui.scroll(correction)
+    return True
 
 
 def action_loop(state: State, config: Config):
     iteration = 0
+    # schedule first click/scroll
+    state.schedule_next_click(config)
+    state.schedule_next_scroll(config)
     while True:
         with state.lock:
             if not state.running:
@@ -163,18 +250,56 @@ def action_loop(state: State, config: Config):
             time.sleep(0.5)
             continue
         iteration += 1
-        target = choose_point(config)
-        move_duration = rand_uniform(config.move_duration_min, config.move_duration_max)
-        perform_move(target, move_duration, config)
-        # random order of click/scroll attempt
-        ops = [maybe_click, maybe_scroll]
-        random.shuffle(ops)
-        for op in ops:
-            op(config)
+        
+        # Occasional "thinking" pause before action (human-like)
+        if random.random() < config.pause_probability:
+            think_pause = rand_uniform(config.pause_duration_min, config.pause_duration_max)
+            if config.verbose or config.dry_run:
+                logging.info("[PAUSE] Thinking pause: %.2fs", think_pause)
+            time.sleep(think_pause)
+        
+        did_micro_move = False
+        if random.random() < config.micro_move_probability:
+            perform_micro_move(config)
+            did_micro_move = True
+
+        if not did_micro_move:
+            target = choose_point(config)
+            move_duration = rand_uniform(config.move_duration_min, config.move_duration_max)
+            perform_move(target, move_duration, config)
+
+        now = time.time()
+        # perform scheduled click if due
+        if now >= state.next_click_at:
+            if random.random() < 0.25:
+                # hesitate, reschedule slightly into future
+                delay = rand_uniform(6.0, 22.0)
+                state.next_click_at = now + delay
+                if config.verbose or config.dry_run:
+                    logging.info("[CLICK] Deferred by %.1fs", delay)
+            else:
+                maybe_click(config)
+                state.schedule_next_click(config)
+        # perform scheduled scroll if due
+        if now >= state.next_scroll_at:
+            if random.random() < 0.3:
+                delay = rand_uniform(5.0, 18.0)
+                state.next_scroll_at = now + delay
+                if config.verbose or config.dry_run:
+                    logging.info("[SCROLL] Deferred by %.1fs", delay)
+            else:
+                maybe_scroll(config)
+                state.schedule_next_scroll(config)
         sleep_time = rand_uniform(config.min_sleep, config.max_sleep)
         if config.verbose or config.dry_run:
             logging.info("[SLEEP] %.2fs (iteration %d)", sleep_time, iteration)
         time.sleep(sleep_time)
+        # occasional longer pause to simulate focus or getting distracted
+        if random.random() < config.long_pause_probability:
+            long_pause = rand_uniform(config.long_pause_min, config.long_pause_max)
+            if config.verbose or config.dry_run:
+                logging.info("[PAUSE] Long pause: %.2fs", long_pause)
+            time.sleep(long_pause)
     logging.info("Loop terminated.")
 
 
@@ -215,6 +340,12 @@ def parse_args() -> Config:
     p.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility.')
     p.add_argument('--verbose', action='store_true', help='Verbose cycle logging.')
     p.add_argument('--prompt-interval', action='store_true', help='Prompt for min/max sleep interval interactively before start.')
+    p.add_argument('--local-move', action='store_true', help='Enable local-only small moves (keep actions near current cursor).')
+    p.add_argument('--move-radius', type=int, default=150, help='Radius in pixels for local moves.')
+    p.add_argument('--click-interval-min', type=float, default=120.0, help='Minimum seconds between random clicks.')
+    p.add_argument('--click-interval-max', type=float, default=480.0, help='Maximum seconds between random clicks.')
+    p.add_argument('--scroll-interval-min', type=float, default=90.0, help='Minimum seconds between random scrolls.')
+    p.add_argument('--scroll-interval-max', type=float, default=360.0, help='Maximum seconds between random scrolls.')
     p.add_argument('--min-move', type=int, default=DEFAULT_MIN_MOVE, help='Minimum move distance (pixels) to perform a full move.')
     args = p.parse_args()
     return Config(
@@ -233,6 +364,12 @@ def parse_args() -> Config:
         verbose=args.verbose,
         min_move=args.min_move,
         prompt_interval=args.prompt_interval,
+    local_move=args.local_move,
+    move_radius=args.move_radius,
+        click_interval_min=args.click_interval_min,
+        click_interval_max=args.click_interval_max,
+        scroll_interval_min=args.scroll_interval_min,
+        scroll_interval_max=args.scroll_interval_max,
     )
 
 
@@ -291,6 +428,9 @@ def main():
 
     if config.seed is not None:
         random.seed(config.seed)
+    # prompt for interval if requested
+    if config.prompt_interval:
+        prompt_for_interval(config)
     state = State()
     logging.info("Anti-AFK mouse mover started.")
     logging.info("Hotkeys: CTRL+ALT+P pause/resume | CTRL+ALT+Q quit | Move mouse to top-left corner to FAILSAFE abort.")
