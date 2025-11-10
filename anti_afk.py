@@ -37,7 +37,7 @@ class Config:
     min_move: int = DEFAULT_MIN_MOVE
     prompt_interval: bool = False
     local_move: bool = False
-    move_radius: int = 110
+    move_radius: int = 20
     click_interval_min: float = 120.0
     click_interval_max: float = 480.0
     scroll_interval_min: float = 90.0
@@ -51,6 +51,9 @@ class Config:
     long_pause_probability: float = 0.05
     long_pause_min: float = 5.0
     long_pause_max: float = 18.0
+    # center-limited movement
+    centered: bool = True
+    center_fraction: float = 0.8  # fraction of half-screen radius to allow
 
 class State:
     def __init__(self):
@@ -90,6 +93,21 @@ def dist(a: Tuple[int, int], b: Tuple[int, int]) -> float:
 
 def choose_point(config: Config) -> Tuple[int, int]:
     width, height = pyautogui.size()
+    if config.centered:
+        cx, cy = width // 2, height // 2
+        max_r = int(min(width, height) / 2 * config.center_fraction)
+        # respect margin
+        max_r = max(0, max_r - config.margin)
+        for _ in range(40):
+            angle = rand_uniform(0, 2 * math.pi)
+            r = rand_uniform(0, max_r)
+            x = int(round(cx + math.cos(angle) * r))
+            y = int(round(cy + math.sin(angle) * r))
+            x = max(config.margin, min(width - config.margin, x))
+            y = max(config.margin, min(height - config.margin, y))
+            if (x, y) != (cx, cy):
+                return x, y
+        return cx, cy
     if config.local_move:
         cx, cy = pyautogui.position()
         for _ in range(20):
@@ -342,6 +360,8 @@ def parse_args() -> Config:
     p.add_argument('--prompt-interval', action='store_true', help='Prompt for min/max sleep interval interactively before start.')
     p.add_argument('--local-move', action='store_true', help='Enable local-only small moves (keep actions near current cursor).')
     p.add_argument('--move-radius', type=int, default=150, help='Radius in pixels for local moves.')
+    p.add_argument('--no-centered', action='store_true', help='Disable center-limited movement (allow full or local moves).')
+    p.add_argument('--center-fraction', type=float, default=0.8, help='Fraction of half-screen radius to allow when centered')
     p.add_argument('--click-interval-min', type=float, default=120.0, help='Minimum seconds between random clicks.')
     p.add_argument('--click-interval-max', type=float, default=480.0, help='Maximum seconds between random clicks.')
     p.add_argument('--scroll-interval-min', type=float, default=90.0, help='Minimum seconds between random scrolls.')
@@ -366,6 +386,8 @@ def parse_args() -> Config:
         prompt_interval=args.prompt_interval,
     local_move=args.local_move,
     move_radius=args.move_radius,
+    centered=not args.no_centered,
+    center_fraction=args.center_fraction,
         click_interval_min=args.click_interval_min,
         click_interval_max=args.click_interval_max,
         scroll_interval_min=args.scroll_interval_min,
@@ -432,6 +454,17 @@ def main():
     if config.prompt_interval:
         prompt_for_interval(config)
     state = State()
+    # if centered mode requested, move cursor to center at startup
+    if config.centered:
+        w, h = pyautogui.size()
+        cx, cy = w // 2, h // 2
+        if config.dry_run:
+            logging.info("[INIT] Would move cursor to center %s", (cx, cy))
+        else:
+            try:
+                pyautogui.moveTo(cx, cy, duration=rand_uniform(0.2, 0.7))
+            except Exception:
+                logging.debug("Failed to move to center on startup")
     logging.info("Anti-AFK mouse mover started.")
     logging.info("Hotkeys: CTRL+ALT+P pause/resume | CTRL+ALT+Q quit | Move mouse to top-left corner to FAILSAFE abort.")
     if config.dry_run:
