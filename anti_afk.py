@@ -1,6 +1,8 @@
 from __future__ import annotations
 import argparse
 import math
+import os
+import platform
 import random
 import sys
 import time
@@ -37,7 +39,7 @@ class Config:
     min_move: int = DEFAULT_MIN_MOVE
     prompt_interval: bool = False
     local_move: bool = False
-    move_radius: int = 20
+    move_radius: int = 150
     click_interval_min: float = 120.0
     click_interval_max: float = 480.0
     scroll_interval_min: float = 90.0
@@ -54,6 +56,7 @@ class Config:
     # center-limited movement
     centered: bool = True
     center_fraction: float = 0.8  # fraction of half-screen radius to allow
+    enable_hotkeys: bool = True
 
 class State:
     def __init__(self):
@@ -89,6 +92,33 @@ def dist(a: Tuple[int, int], b: Tuple[int, int]) -> float:
     dx = a[0] - b[0]
     dy = a[1] - b[1]
     return math.hypot(dx, dy)
+
+
+def detect_platform() -> str:
+    name = platform.system().lower()
+    if "darwin" in name:
+        return "mac"
+    if "windows" in name:
+        return "windows"
+    if "linux" in name:
+        return "linux"
+    return "unknown"
+
+
+def log_platform_notes(platform_name: str):
+    if platform_name == "mac":
+        logging.info("Platform detected: macOS")
+        logging.info("Grant Accessibility permission to Terminal/Python in System Settings → Privacy & Security → Accessibility.")
+    elif platform_name == "windows":
+        logging.info("Platform detected: Windows")
+        logging.info("If hotkeys do not respond, try running the terminal as Administrator.")
+    elif platform_name == "linux":
+        logging.info("Platform detected: Linux")
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            logging.warning("DISPLAY/WAYLAND variable not found. pyautogui needs a graphical session (X11/Wayland).")
+        logging.info("Install dependencies such as python3-xlib, scrot, and xclip for best results: sudo apt install python3-xlib scrot xclip")
+    else:
+        logging.info("Platform detected: %s", platform_name)
 
 
 def choose_point(config: Config) -> Tuple[int, int]:
@@ -367,6 +397,7 @@ def parse_args() -> Config:
     p.add_argument('--scroll-interval-min', type=float, default=90.0, help='Minimum seconds between random scrolls.')
     p.add_argument('--scroll-interval-max', type=float, default=360.0, help='Maximum seconds between random scrolls.')
     p.add_argument('--min-move', type=int, default=DEFAULT_MIN_MOVE, help='Minimum move distance (pixels) to perform a full move.')
+    p.add_argument('--no-hotkeys', action='store_true', help='Disable global hotkeys (use CTRL+C or window close to exit).')
     args = p.parse_args()
     return Config(
         min_sleep=args.min_sleep,
@@ -384,14 +415,15 @@ def parse_args() -> Config:
         verbose=args.verbose,
         min_move=args.min_move,
         prompt_interval=args.prompt_interval,
-    local_move=args.local_move,
-    move_radius=args.move_radius,
-    centered=not args.no_centered,
-    center_fraction=args.center_fraction,
+        local_move=args.local_move,
+        move_radius=args.move_radius,
+        centered=not args.no_centered,
+        center_fraction=args.center_fraction,
         click_interval_min=args.click_interval_min,
         click_interval_max=args.click_interval_max,
         scroll_interval_min=args.scroll_interval_min,
         scroll_interval_max=args.scroll_interval_max,
+        enable_hotkeys=not args.no_hotkeys,
     )
 
 
@@ -448,6 +480,9 @@ def main():
     level = logging.DEBUG if config.verbose else logging.INFO
     logging.basicConfig(format='[%(levelname)s] %(message)s', level=level)
 
+    platform_name = detect_platform()
+    log_platform_notes(platform_name)
+
     if config.seed is not None:
         random.seed(config.seed)
     # prompt for interval if requested
@@ -466,12 +501,15 @@ def main():
             except Exception:
                 logging.debug("Failed to move to center on startup")
     logging.info("Anti-AFK mouse mover started.")
-    logging.info("Hotkeys: CTRL+ALT+P pause/resume | CTRL+ALT+Q quit | Move mouse to top-left corner to FAILSAFE abort.")
     if config.dry_run:
         logging.info("Dry-run mode: no real input events will be sent.")
-    # Start keyboard listener thread
-    t_listener = threading.Thread(target=keyboard_listener, args=(state,), daemon=True)
-    t_listener.start()
+    if config.enable_hotkeys:
+        logging.info("Hotkeys: CTRL+ALT+P pause/resume | CTRL+ALT+Q quit.")
+        t_listener = threading.Thread(target=keyboard_listener, args=(state,), daemon=True)
+        t_listener.start()
+    else:
+        logging.info("Hotkeys disabled. Use CTRL+C or close the window to exit.")
+    logging.info("Move mouse to top-left corner to trigger PyAutoGUI fail-safe if needed.")
     try:
         action_loop(state, config)
     except pyautogui.FailSafeException:
